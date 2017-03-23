@@ -37,16 +37,15 @@ def ff_layer(inputs, dim, scope, activation=None):
 
 def _shift(tensor):
     # tensor: [batch_size, seq_len, dim]
-    shape = [s.value for s in tensor.get_shape()]
-    shape[1] = 1
-    res = tf.concat(1, [tf.zeros(shape),  tensor[:, -1]])
+    res = tf.concat(1, [tf.zeros_like(tensor[:, 0:1, :]),  tensor[:, :-1, :]])
     return res
 
 def gru_layer(inputs, masks, dim, scope_name):
     # x: [batch_size, seq_len, word_dim] list of [batch_size, word_dim]
     # mask: [batch_size, seq_len]
     seq_len = inputs.get_shape()[1]
-    inputs = [tf.squeeze(x) for x in tf.split(1, seq_len, inputs)]
+    batch_size = tf.shape(inputs)[0]
+    inputs = [tf.squeeze(x, [1]) for x in tf.split(1, seq_len, inputs)]
     masks = tf.split(1, seq_len, masks) # list of [batch_size, 1]
     def _gru_step(h_prev, x, m):
         # reset and update gates
@@ -60,10 +59,11 @@ def gru_layer(inputs, masks, dim, scope_name):
             h = m * h + (1. - m) * h_prev
         return h
     outputs = []
+
     with tf.variable_scope(scope_name) as scope:
         for t in xrange(seq_len):
             if t == 0:
-                outputs.append(_gru_step(tf.zeros([inputs[0], dim]), inputs[t], masks[t]))
+                outputs.append(_gru_step(tf.zeros([batch_size, dim]), inputs[t], masks[t]))
             else:
                 scope.reuse_variables()
                 outputs.append(_gru_step(outputs[-1], inputs[t], masks[t]))
@@ -72,7 +72,7 @@ def gru_layer(inputs, masks, dim, scope_name):
 
 def cond_gru_layer(inputs, masks, context, init_state, dim, scope_name):
     seq_len = inputs.get_shape()[1]
-    inputs = [tf.squeeze(x) for x in tf.split(1, seq_len, inputs)]
+    inputs = [tf.squeeze(x, [1]) for x in tf.split(1, seq_len, inputs)]
     masks = tf.split(1, seq_len, masks)
     def _cond_gru_step(h_prev, x, m):
         with tf.variable_scope('cond_gru_layer'):
@@ -128,8 +128,9 @@ class Model:
         self.ss_ = cond_gru_layer(self.y_embed_shifted, self.y_mask, self.context, init_state, params['hidden_dim'], 'decoder')  # [seq_len, batch_size, hidden_dim]
         contexts = tf.expand_dims(self.context, 1) # [batch_size, 1, hidden_dim]
         # compute word probabilities
-        logit_lstm = ff_layer(tf.transpose(tf.pack(self.ss_), [0, 1]), params['word_dim'], 'ff_logit_lstm')
-        logit_prev = ff_layer(self.y_embed_shifted, [0, 1], params['word_dim'], 'ff_logit_prev')
+        ss_ = tf.concat(1, [tf.expand_dims(t, 1) for t in self.ss_])
+        logit_lstm = ff_layer(ss_, params['word_dim'], 'ff_logit_lstm')
+        logit_prev = ff_layer(self.y_embed_shifted, params['word_dim'], 'ff_logit_prev')
         logit_ctx = ff_layer(contexts, params['word_dim'], 'ff_logit_ctx')
         logits = tf.nn.tanh(logit_lstm + logit_prev + logit_ctx)
         logits = ff_layer(logits, params['target_vocab_size'], 'ff_logit')  # [batch_size, seq_len, target_vocab_size]
