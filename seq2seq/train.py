@@ -46,8 +46,8 @@ if __name__ == '__main__':
         lno = 0
         total_loss = 0.
         for data in dataset.train_batch_iterator(config['dataset'], config['batch_size']):
-            source, target, source_mask, target_mask = [np.transpose(e) for e in data]
-
+            # source, target, source_mask, target_mask = [np.transpose(e) for e in data]
+            source, target, source_mask, target_mask = data
             if lno % 1000 == 0:
                 sys.stdout.write("Process to %d\r" % lno)
                 sys.stdout.flush()
