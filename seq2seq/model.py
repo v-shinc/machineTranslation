@@ -1,5 +1,5 @@
 import tensorflow as tf
-
+import numpy as np
 
 
 def _linear(args, output_size, scope):
@@ -70,10 +70,8 @@ def gru_layer(inputs, masks, dim, scope_name):
     #hidden_states = tf.scan(_gru_step, [inputs, masks], initializer=tf.zeros([inputs.get_shape()[1], dim]))
     return outputs
 
-def cond_gru_layer(inputs, masks, context, init_state, dim, scope_name):
-    seq_len = inputs.get_shape()[1]
-    inputs = [tf.squeeze(x, [1]) for x in tf.split(1, seq_len, inputs)]
-    masks = tf.split(1, seq_len, masks)
+def cond_gru_layer(inputs, masks, context, init_state, dim, scope_name, one_step=False):
+
     def _cond_gru_step(h_prev, x, m):
         with tf.variable_scope('cond_gru_layer'):
 
@@ -82,24 +80,33 @@ def cond_gru_layer(inputs, masks, context, init_state, dim, scope_name):
             h = tf.nn.tanh(_linear([x, h_prev * r, context], dim, 'state'))
             # leaky integrate and obtain next hidden state
             h = z * h_prev + (1. - z) * h
-            h = m * h + (1. - m) * h_prev
+            if masks != None:
+                h = m * h + (1. - m) * h_prev
         return h
-    outputs = []
-    with tf.variable_scope(scope_name) as scope:
-        for t in xrange(seq_len):
-            if t == 0:
-                outputs.append(_cond_gru_step(init_state, inputs[t], masks[t]))
-            else:
-                scope.reuse_variables()
-                outputs.append(_cond_gru_step(outputs[-1], inputs[t], masks[t]))
-    #hidden_states = tf.scan(_cond_gru_step, [inputs, masks], initializer=init_state)
-    return outputs
+    if one_step:
+        return [_cond_gru_step(init_state, inputs, None)]  # return a tensor
+    else:
+        seq_len = inputs.get_shape()[1]
+        inputs = [tf.squeeze(x, [1]) for x in tf.split(1, seq_len, inputs)]
+        masks = tf.split(1, seq_len, masks)
+        outputs = []
+        with tf.variable_scope(scope_name) as scope:
+            for t in xrange(seq_len):
+                if t == 0:
+                    outputs.append(_cond_gru_step(init_state, inputs[t], masks[t]))
+                else:
+                    scope.reuse_variables()
+                    outputs.append(_cond_gru_step(outputs[-1], inputs[t], masks[t]))
+        #hidden_states = tf.scan(_cond_gru_step, [inputs, masks], initializer=init_state)
+        return outputs  # return list of tensor
 
 
 class Model:
     def __init__(self, params):
         batch_size = params['batch_size']
         max_len = params['max_len']
+        word_dim = params['word_dim']
+        hidden_dim = params['hidden_dim']
         self.x = tf.placeholder(tf.int32, [None, max_len], name='x')
         self.x_mask = tf.placeholder(tf.float32, [None, max_len], name='x_mask')
         self.y = tf.placeholder(tf.int32, [None, max_len], name='y')
@@ -129,11 +136,12 @@ class Model:
         contexts = tf.expand_dims(self.context, 1) # [batch_size, 1, hidden_dim]
         # compute word probabilities
         ss_ = tf.concat(1, [tf.expand_dims(t, 1) for t in self.ss_])
-        logit_lstm = ff_layer(ss_, params['word_dim'], 'ff_logit_lstm')
-        logit_prev = ff_layer(self.y_embed_shifted, params['word_dim'], 'ff_logit_prev')
-        logit_ctx = ff_layer(contexts, params['word_dim'], 'ff_logit_ctx')
-        logits = tf.nn.tanh(logit_lstm + logit_prev + logit_ctx)
-        logits = ff_layer(logits, params['target_vocab_size'], 'ff_logit')  # [batch_size, seq_len, target_vocab_size]
+        with tf.variable_scope('word_prob'):
+            logit_lstm = ff_layer(ss_, params['word_dim'], 'ff_logit_lstm')
+            logit_prev = ff_layer(self.y_embed_shifted, params['word_dim'], 'ff_logit_prev')
+            logit_ctx = ff_layer(contexts, params['word_dim'], 'ff_logit_ctx')
+            logits = tf.nn.tanh(logit_lstm + logit_prev + logit_ctx)
+            logits = ff_layer(logits, params['target_vocab_size'], 'ff_logit')  # [batch_size, seq_len, target_vocab_size]
 
         # cost
         labels = tf.one_hot(self.y, params['target_vocab_size'])
@@ -143,6 +151,23 @@ class Model:
 
         # train operator
         self.train_op = tf.train.GradientDescentOptimizer(params['lr']).minimize(self.cost)
+
+        # build graph for beam search
+        self.cur_y = tf.placeholder(tf.int32, [None], name='cur_y')
+        self.prev_state = tf.placeholder(tf.float32, [None, params['hidden_dim']], name="prev_state")
+        self.context = tf.placeholder(tf.float32, [None, params['hidden_dim']], name="context")
+        cur_y_emb = tf.nn.embedding_lookup(y_embedding, self.cur_y)
+        # apply one step of gru layer
+        proj = cond_gru_layer(cur_y_emb, None, self.context, self.prev_state, params['hidden_dim'], "predict", one_step=True)
+        self.next_state = proj[0]
+        with tf.variable_scope('word_prob') as scope:
+            scope.reuse_variables()
+            cur_logit_lstm = ff_layer(proj[0], word_dim, "ff_logit_lstm")
+            cur_logit_prev = ff_layer(self.prev_state, word_dim, 'ff_logit_prev')
+            cur_logit_ctx = ff_layer(self.context, word_dim, "ff_logit_ctx")
+            cur_logits = tf.nn.tanh(cur_logit_lstm + cur_logit_prev + cur_logit_ctx)
+            cur_logits = ff_layer(cur_logits, params['target_vocab_size'], 'ff_logit')  # [batch_size, target_vocab_size]
+            self.next_prob = tf.nn.softmax(cur_logits)
 
         config = tf.ConfigProto()
         config.gpu_options.allow_growth = True
@@ -164,8 +189,16 @@ class Model:
         _, loss = self.session.run([self.train_op, self.cost], feed_dict)
         return loss
 
-    def predict(self):
-        pass
+    def predict(self, soursce, k):
+        # beam search
+        live_k = 1
+        dead_k = 0
+
+        hyp_samples = [[]] * live_k
+        hyp_scores = np.zeros(live_k).astype('float32')
+
+        # get initial state of decoder rnn and encoder context
+        self.session.run([self.next_state, self.next_prob])
 
     def save(self, save_path):
         return self.saver.save(self.session, save_path)
