@@ -1,5 +1,6 @@
 import tensorflow as tf
 import numpy as np
+import copy
 
 
 def _linear(args, output_size, scope):
@@ -8,7 +9,6 @@ def _linear(args, output_size, scope):
     for shape in shapes:
         if shape.ndims != 2:
             raise ValueError("linear is expecting 2D arguments: %s" % shapes)
-
     total_arg_size = sum([shape[1].value for shape in shapes])
     dtype = args[0].dtype
 
@@ -35,10 +35,6 @@ def ff_layer(inputs, dim, scope, activation=None):
         res = tf.reshape(res, shape)
     return res
 
-def _shift(tensor):
-    # tensor: [batch_size, seq_len, dim]
-    res = tf.concat(1, [tf.zeros_like(tensor[:, 0:1, :]),  tensor[:, :-1, :]])
-    return res
 
 def gru_layer(inputs, masks, dim, scope_name):
     # x: [batch_size, seq_len, word_dim] list of [batch_size, word_dim]
@@ -72,19 +68,21 @@ def gru_layer(inputs, masks, dim, scope_name):
 
 def cond_gru_layer(inputs, masks, context, init_state, dim, scope_name, one_step=False):
 
-    def _cond_gru_step(h_prev, x, m):
+    def _cond_gru_step(h_prev, x, m, ctx):
         with tf.variable_scope('cond_gru_layer'):
 
-            r, z = tf.split(1, 2, tf.nn.sigmoid(_linear([h_prev, x, context], 2 * dim, 'gate')))
+            r, z = tf.split(1, 2, tf.nn.sigmoid(_linear([h_prev, x, ctx], 2 * dim, 'gate')))
             # hidden state proposal
-            h = tf.nn.tanh(_linear([x, h_prev * r, context], dim, 'state'))
+            h = tf.nn.tanh(_linear([x, h_prev * r, ctx], dim, 'state'))
             # leaky integrate and obtain next hidden state
             h = z * h_prev + (1. - z) * h
             if masks != None:
                 h = m * h + (1. - m) * h_prev
         return h
     if one_step:
-        return [_cond_gru_step(init_state, inputs, None)]  # return a tensor
+        with tf.variable_scope(scope_name) as scope:
+            scope.reuse_variables()
+            return [_cond_gru_step(init_state, inputs, None, context)]  # return a tensor
     else:
         seq_len = inputs.get_shape()[1]
         inputs = [tf.squeeze(x, [1]) for x in tf.split(1, seq_len, inputs)]
@@ -93,10 +91,10 @@ def cond_gru_layer(inputs, masks, context, init_state, dim, scope_name, one_step
         with tf.variable_scope(scope_name) as scope:
             for t in xrange(seq_len):
                 if t == 0:
-                    outputs.append(_cond_gru_step(init_state, inputs[t], masks[t]))
+                    outputs.append(_cond_gru_step(init_state, inputs[t], masks[t], context))
                 else:
                     scope.reuse_variables()
-                    outputs.append(_cond_gru_step(outputs[-1], inputs[t], masks[t]))
+                    outputs.append(_cond_gru_step(outputs[-1], inputs[t], masks[t], context))
         #hidden_states = tf.scan(_cond_gru_step, [inputs, masks], initializer=init_state)
         return outputs  # return list of tensor
 
@@ -124,50 +122,60 @@ class Model:
 
         self.context = hh[-1] #[batch_size, hidden_dim]
         # initial decoder state
-        init_state = ff_layer(self.context, params['hidden_dim'], 'ff_state', tf.nn.tanh)
+        self.init_state = ff_layer(self.context, params['hidden_dim'], 'ff_state', tf.nn.tanh)
 
         # word embedding (target)
-        self.y_emb = tf.nn.embedding_lookup(y_embedding, self.y)
-        self.y_embed_shifted = _shift(self.y_emb) # [batch_size, seq_len, word_dim]
+
+        y_emb = tf.nn.embedding_lookup(y_embedding, self.y)
+        # shift one time step to right
+        y_embed_shifted = tf.concat(1, [tf.zeros_like(y_emb[:, 0:1, :]), y_emb[:, :-1, :]]) # [batch_size, seq_len, word_dim]
 
         # decoder - pass through the decoder gru, recurrence here
 
-        self.ss_ = cond_gru_layer(self.y_embed_shifted, self.y_mask, self.context, init_state, params['hidden_dim'], 'decoder')  # [seq_len, batch_size, hidden_dim]
-        contexts = tf.expand_dims(self.context, 1) # [batch_size, 1, hidden_dim]
+        ss_ = cond_gru_layer(y_embed_shifted, self.y_mask, self.context, self.init_state, hidden_dim, 'decoder')  # [seq_len, batch_size, hidden_dim]
+        contexts = tf.expand_dims(self.context, 1)  # [batch_size, 1, hidden_dim]
         # compute word probabilities
-        ss_ = tf.concat(1, [tf.expand_dims(t, 1) for t in self.ss_])
+        ss_ = tf.concat(1, [tf.expand_dims(t, 1) for t in ss_])
+
         with tf.variable_scope('word_prob'):
-            logit_lstm = ff_layer(ss_, params['word_dim'], 'ff_logit_lstm')
-            logit_prev = ff_layer(self.y_embed_shifted, params['word_dim'], 'ff_logit_prev')
-            logit_ctx = ff_layer(contexts, params['word_dim'], 'ff_logit_ctx')
+            logit_lstm = ff_layer(ss_, word_dim, 'ff_logit_lstm')
+            logit_prev = ff_layer(y_embed_shifted, word_dim, 'ff_logit_prev')
+            logit_ctx = ff_layer(contexts, word_dim, 'ff_logit_ctx')
             logits = tf.nn.tanh(logit_lstm + logit_prev + logit_ctx)
             logits = ff_layer(logits, params['target_vocab_size'], 'ff_logit')  # [batch_size, seq_len, target_vocab_size]
 
         # cost
         labels = tf.one_hot(self.y, params['target_vocab_size'])
         probs = tf.reshape(tf.nn.softmax(tf.reshape(logits, [-1, params['target_vocab_size']])), [-1, max_len, params['target_vocab_size']])
-        cost = tf.log(tf.reduce_sum(labels * probs, 2)) # [batch_size, seq_len]
+        cost = tf.log(tf.reduce_sum(labels * probs, 2))   # [batch_size, seq_len]
         self.cost = - tf.reduce_mean(tf.reduce_sum(cost * self.y_mask, 1))
 
         # train operator
-        self.train_op = tf.train.GradientDescentOptimizer(params['lr']).minimize(self.cost)
+        self.train_op = tf.train.AdamOptimizer(params['lr']).minimize(self.cost)
 
         # build graph for beam search
         self.cur_y = tf.placeholder(tf.int32, [None], name='cur_y')
         self.prev_state = tf.placeholder(tf.float32, [None, params['hidden_dim']], name="prev_state")
-        self.context = tf.placeholder(tf.float32, [None, params['hidden_dim']], name="context")
-        cur_y_emb = tf.nn.embedding_lookup(y_embedding, self.cur_y)
+        self.context_input = tf.placeholder(tf.float32, [None, params['hidden_dim']], name="context")
+
+        self.cur_y_emb = tf.cond(
+            (self.cur_y < tf.zeros_like(self.cur_y))[0],
+            lambda: tf.zeros([tf.shape(self.cur_y)[0], word_dim]),
+            lambda: tf.nn.embedding_lookup(y_embedding, self.cur_y)
+        )
+
         # apply one step of gru layer
-        proj = cond_gru_layer(cur_y_emb, None, self.context, self.prev_state, params['hidden_dim'], "predict", one_step=True)
+        proj = cond_gru_layer(self.cur_y_emb, None, self.context_input, self.prev_state, hidden_dim, "decoder", one_step=True)
         self.next_state = proj[0]
         with tf.variable_scope('word_prob') as scope:
             scope.reuse_variables()
-            cur_logit_lstm = ff_layer(proj[0], word_dim, "ff_logit_lstm")
-            cur_logit_prev = ff_layer(self.prev_state, word_dim, 'ff_logit_prev')
-            cur_logit_ctx = ff_layer(self.context, word_dim, "ff_logit_ctx")
+
+            cur_logit_lstm = ff_layer(self.prev_state, word_dim, "ff_logit_lstm")
+            cur_logit_prev = ff_layer(self.cur_y_emb, word_dim, 'ff_logit_prev')
+            cur_logit_ctx = ff_layer(self.context_input, word_dim, "ff_logit_ctx")
             cur_logits = tf.nn.tanh(cur_logit_lstm + cur_logit_prev + cur_logit_ctx)
             cur_logits = ff_layer(cur_logits, params['target_vocab_size'], 'ff_logit')  # [batch_size, target_vocab_size]
-            self.next_prob = tf.nn.softmax(cur_logits)
+        self.next_prob = tf.nn.softmax(cur_logits)
 
         config = tf.ConfigProto()
         config.gpu_options.allow_growth = True
@@ -189,7 +197,10 @@ class Model:
         _, loss = self.session.run([self.train_op, self.cost], feed_dict)
         return loss
 
-    def predict(self, soursce, k):
+    def predict(self, x, x_mask, k, max_len):
+
+        sample = []
+        sample_score = []
         # beam search
         live_k = 1
         dead_k = 0
@@ -198,7 +209,63 @@ class Model:
         hyp_scores = np.zeros(live_k).astype('float32')
 
         # get initial state of decoder rnn and encoder context
-        self.session.run([self.next_state, self.next_prob])
+
+        feed_dict = {self.x: x, self.x_mask: x_mask}
+        next_state, context0 = self.session.run([self.init_state, self.context], feed_dict)
+
+        next_word = np.array([-1])
+        for t in xrange(max_len):
+            ctx = np.tile(context0, [live_k, 1])  # [live_k, hidden_dim]
+            next_state, next_prob, cur_y_emb = self.session.run([self.next_state, self.next_prob, self.cur_y_emb], feed_dict={
+                self.context_input: ctx,
+                self.cur_y: next_word,
+                self.prev_state: next_state
+            })
+            cand_scores = hyp_scores[:, None] - np.log(next_prob)
+            cand_flat = cand_scores.flatten()
+            ranks_flat = cand_flat.argsort()[:(k - dead_k)]
+
+            voc_size = next_prob.shape[1]
+            trans_indices = ranks_flat / voc_size
+            word_indices = ranks_flat % voc_size
+            costs = cand_flat[ranks_flat]
+
+            new_hyp_samples = []
+            new_hyp_scores = np.zeros(k - dead_k).astype('float32')
+            new_hyp_states = []
+
+            for idx, [ti, wi] in enumerate(zip(trans_indices, word_indices)):
+                new_hyp_samples.append(hyp_samples[ti] + [wi])
+                new_hyp_scores[idx] = copy.copy(costs[idx])
+                new_hyp_states.append(copy.copy(next_state[ti]))
+
+            # check the finished sample
+            new_live_k = 0
+            hyp_samples = []
+            hyp_scores = []
+            hyp_states = []
+            for idx in xrange(len(new_hyp_samples)):
+                if new_hyp_samples[idx][-1] == 0:
+                    sample.append(new_hyp_samples[idx])
+                    sample_score.append(new_hyp_scores[idx])
+                    dead_k += 1
+                else:
+                    new_live_k += 1
+                    hyp_samples.append(new_hyp_samples[idx])
+                    hyp_scores.append(new_hyp_scores[idx])
+                    hyp_states.append(new_hyp_states[idx])
+            hyp_scores = np.array(hyp_scores)
+            live_k = new_live_k
+
+            if new_live_k < 1:
+                break
+            if dead_k >= k:
+                break
+            next_word = np.array([w[-1] for w in hyp_samples])
+            next_state = np.array(hyp_states)
+        if len(sample) == 0:
+            return hyp_samples, hyp_scores
+        return sample, sample_score
 
     def save(self, save_path):
         return self.saver.save(self.session, save_path)

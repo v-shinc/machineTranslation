@@ -31,9 +31,9 @@ if __name__ == '__main__':
     else:
         config['load_path'] = None
 
-    dataset = DataSet(config['dictionaries'], config['max_len'], n_words_source=10000, n_word_target=10000)
-    config['source_vocab_size'] = dataset.num_source_word
-    config['target_vocab_size'] = dataset.num_target_word
+    dataset = DataSet(config['dictionaries'], config['max_len'], n_words_source=config['source_vocab_size'], n_word_target=config['target_vocab_size'])
+    #config['source_vocab_size'] = dataset.num_source_word
+    #config['target_vocab_size'] = dataset.num_target_word
 
     fout_log = open(log_path, 'a')
     with open(config_path, 'w') as fout:
@@ -46,7 +46,7 @@ if __name__ == '__main__':
         lno = 0
         total_loss = 0.
         for data in dataset.train_batch_iterator(config['dataset'], config['batch_size']):
-            # source, target, source_mask, target_mask = [np.transpose(e) for e in data]
+
             source, target, source_mask, target_mask = data
             if lno % 1000 == 0:
                 sys.stdout.write("Process to %d\r" % lno)

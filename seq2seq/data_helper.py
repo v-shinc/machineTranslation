@@ -75,6 +75,22 @@ class DataSet:
     def num_target_word(self):
         return self.n_word_target if self.n_word_target >= 0 else len(self.target_word2id)
 
+    def create_model_input(self, sentences):
+        # sentences: list of string
+        source_masks = []
+        sources = []
+        for sent in sentences:
+            ss = [self.source_word2id.get(w, 1) for w in sent.split()]
+            ss.append(0)
+            if len(ss) > self.max_len:
+                ss = ss[:self.max_len]
+            source_masks.append([1] * len(ss) + [0] * (self.max_len - len(ss)))
+            ss += (self.max_len - len(ss)) * [0]
+            if self.n_word_source >= 0:
+                ss = [i if i < self.n_word_source else 1 for i in ss]
+            sources.append(ss)
+        return np.array(sources), np.array(source_masks)
+
     def train_batch_iterator(self, dataset, batch_size):
         sources = LineIterator([fn for fn, _ in dataset])
         targets = LineIterator([fn for _, fn in dataset])
@@ -84,25 +100,17 @@ class DataSet:
         target_mask = []
         for s in sources:
             t = targets.next().split()
-
-            ss = []
-            for w in s.split():
-
-                if w in self.source_word2id:
-                    ss.append(self.source_word2id[w])
-                else:
-                    ss.append(1)
+            ss = [self.source_word2id.get(w, 1) for w in s.split()]
+            ss += [0]
             if len(ss) > self.max_len:
                 continue
-            tt = []
-            for w in t:
-                if w in self.target_word2id:
-                    tt.append(self.target_word2id[w])
-                else:
-                    tt.append(1)
+
+            tt = [self.target_word2id.get(w, 1) for w in t]
+            tt += [0]
             if len(tt) > self.max_len:
                 continue
             # pad batches
+
             source_mask.append([1] * len(ss) + [0] * (self.max_len - len(ss)))
             target_mask.append([1] * len(tt) + [0] * (self.max_len - len(tt)))
             ss += (self.max_len - len(ss)) * [0]
@@ -112,15 +120,34 @@ class DataSet:
                 ss = [i if i < self.n_word_source else 1 for i in ss]
             if self.n_word_target >= 0:
                 tt = [i if i < self.n_word_target else 1 for i in tt]
+
             source_buff.append(ss)
             target_buff.append(tt)
             if len(source_buff) == batch_size:
+
                 yield [np.array(e) for e in source_buff, target_buff, source_mask, target_mask]
+
                 source_buff = []
                 target_buff = []
                 source_mask, target_mask = [], []
 
+    def to_readable_source(self, indices):
+        sentence = []
+        for i in indices:
+            if i == 0:
+                return sentence
+            else:
+                sentence.append(self.source_id2word[i])
+        return sentence
 
+    def to_readable(self, indices):
+        sentence = []
+        for i in indices:
+            if i == 0:
+                return sentence
+            else:
+                sentence.append(self.target_id2word[i])
+        return sentence
 
 if __name__ == '__main__':
     # gen_word_count_list(['../data/europarl-v7.fr-en.en.tok.shuf', "../data/newstest2011.en.tok"], "../data/word.count.en")
